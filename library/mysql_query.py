@@ -29,6 +29,10 @@ options:
     required: false
     description:
         - dictionary of additional values that will be used iff an insert is required.
+  return_id:
+    required: false
+    description:
+      - whether to return the retrieved/inserted/updated value of the 'id' column.
 """
 
 EXAMPLES = """
@@ -90,6 +94,7 @@ INSERT_REQUIRED = 1
 UPDATE_REQUIRED = 2
 NO_ACTION_REQUIRED = 3
 ERR_NO_SUCH_TABLE = 4
+ERR_NO_ID_COLUMN = 5
 
 
 def weak_equals(a, b):
@@ -160,7 +165,7 @@ def check_row_exists(cursor, table, identifiers):
     return exists == 1
 
 
-def change_required(state, cursor, table, identifiers, desired_values):
+def change_required(state, cursor, table, identifiers, desired_values, return_id):
     """
     check if a change is required
     :param state: state, either 'present' or 'absent'
@@ -175,56 +180,64 @@ def change_required(state, cursor, table, identifiers, desired_values):
     :rtype: int
     """
 
+    # initialize row_id: None = we don't want the row id, -1 = not yet found or required
+    row_id = None if not return_id else -1
+
     # first, let's determine if we do a simple existence-check, or if we also have to compare values
     if state == "absent" or not desired_values:
         row_exists = check_row_exists(cursor, table, identifiers)
 
         if state == "absent" and row_exists:
-            return DELETE_REQUIRED
+            return DELETE_REQUIRED, row_id
 
         if state == "present" and not row_exists:
-            return INSERT_REQUIRED
+            return INSERT_REQUIRED, row_id
 
         # other cases:  state == "absent" and not row_exists:
         #               state == "present" and row_exists
         # both require no action
-        return NO_ACTION_REQUIRED
+        return NO_ACTION_REQUIRED, row_id
 
     # ok, we have to compare values, so let's make a query selecting all the columns with desired_values
     query = "select {columns} from {table} where {values}".format(
         table=table,
-        columns=", ".join(desired_values.keys()),
+        columns=", ".join(desired_values.keys() + (['id'] if row_id is not None else [])),
         values=" AND ".join(generate_where_segment(identifiers.items())),
     )
 
     try:
         res = cursor.execute(query)
-    except mysql_driver.ProgrammingError as e:
+    except mysql_driver.Error as e:
         (errcode, message) = e.args
         if errcode == 1146:
-            return ERR_NO_SUCH_TABLE
+            return ERR_NO_SUCH_TABLE, row_id
+        elif errcode == 1054:
+            return ERR_NO_ID_COLUMN, row_id
         else:
             raise e
 
     # if no row has been found at all, an insert is required
     if res == 0:
-        return INSERT_REQUIRED
+        return INSERT_REQUIRED, row_id
 
     # a row has been found, so we need to compare the returned values:
 
     # bring the values argument into shape to compare directly to fetchone() result
     expected_query_result = tuple(desired_values.values())
-    actual_result = cursor.fetchone()
+    actual_result = list(cursor.fetchone())
+    # pop id column for not messing with comparison
+    if row_id is not None:
+        row_id = actual_result.pop(-1)
 
     # compare expected_query_result to actual_result with implicit casting
     if tuples_weak_equals(expected_query_result, actual_result):
-        return NO_ACTION_REQUIRED
+        return NO_ACTION_REQUIRED, row_id
 
     # a record has been found but does not match the desired values
-    return UPDATE_REQUIRED
+    return UPDATE_REQUIRED, row_id
 
 
-def execute_action(cursor, action, table, identifier, values, defaults):
+def execute_action(cursor, action, table, identifier, values, defaults, row_id):
     """
     when not running in check mode, this function carries out the required changes
     :param action: the actual action to execute
@@ -238,28 +251,28 @@ def execute_action(cursor, action, table, identifier, values, defaults):
     """
     try:
         if action == DELETE_REQUIRED:
-            return delete_record(cursor, table, identifier)
+            return delete_record(cursor, table, identifier, row_id)
         if action == INSERT_REQUIRED:
-            return insert_record(cursor, table, identifier, values, defaults)
+            return insert_record(cursor, table, identifier, values, defaults, row_id)
         elif action == UPDATE_REQUIRED:
-            return update_record(cursor, table, identifier, values)
+            return update_record(cursor, table, identifier, values, row_id)
         else:
             return {'failed': True, 'msg': 'Internal Error: unknown action "%s" required' % action}
     except Exception as e:
         return {'failed': True, 'msg': 'updating/inserting/deleting the record failed due to "%s".' % str(e)}
 
 
-def update_record(cursor, table, identifiers, values):
+def update_record(cursor, table, identifiers, values, row_id):
     where = ' AND '.join(['{0} = %s'.format(column) for column in identifiers.keys()])
     value = ', '.join(['{0} = %s'.format(column) for column in values.keys()])
 
     query = "UPDATE {0} set {1} where {2} limit 1".format(table, value, where)
 
     cursor.execute(query, tuple(list(values.values()) + list(identifiers.values())))
-    return dict(changed=True, msg='Successfully updated one row')
+    return dict(changed=True, msg='Successfully updated one row', row_id=row_id)
 
 
-def insert_record(cursor, table, identifiers, values, defaults):
+def insert_record(cursor, table, identifiers, values, defaults, row_id):
     row_data = dict(list(identifiers.items()) + list(values.items()) + list(defaults.items()))
     value_placeholder = ", ".join(["%s"] * len(row_data))
 
@@ -270,14 +283,16 @@ def insert_record(cursor, table, identifiers, values, defaults):
     )
 
     cursor.execute(query, tuple(row_data.values()))
-    return dict(changed=True, msg='Successfully inserted a new row')
+    if row_id is not None:
+        row_id = cursor.lastrowid
+    return dict(changed=True, msg='Successfully inserted a new row', row_id=row_id)
 
 
-def delete_record(cursor, table, identifiers):
+def delete_record(cursor, table, identifiers, row_id):
     where = ' AND '.join(['{0} = %s'.format(column) for column in identifiers.keys()])
     query = "DELETE FROM {0} WHERE {1}".format(table, where)
     cursor.execute(query, tuple(identifiers.values()))
-    return dict(changed=True, msg='Successfully deleted one row')
+    return dict(changed=True, msg='Successfully deleted one row', row_id=row_id)
 
 
 def build_connection_parameter(params):
@@ -327,7 +342,7 @@ def extract_column_value_maps(parameter):
 
 
 def failed(action):
-    return action == ERR_NO_SUCH_TABLE
+    return action in (ERR_NO_SUCH_TABLE, ERR_NO_ID_COLUMN)
 
 
 def main():
@@ -346,9 +361,7 @@ def main():
             identifiers=dict(required=True, type='dict'),
             values=dict(default=None, type='dict'),
             defaults=dict(default=None, type='dict'),
-
-            #allow_insert=dict(default=False, type='bool'),
-            #limit=dict(default=1, type='int'),
+            return_id=dict(default=False, type='bool')
         ),
         supports_check_mode=True
     )
@@ -367,19 +380,21 @@ def main():
         INSERT_REQUIRED: dict(changed=True, msg='No such record, need to insert'),
         UPDATE_REQUIRED: dict(changed=True, msg='Records needs to be updated'),
         NO_ACTION_REQUIRED: dict(changed=False),
-        ERR_NO_SUCH_TABLE: dict(failed=True, msg='No such table %s' % table)
+        ERR_NO_SUCH_TABLE: dict(failed=True, msg='No such table %s' % table),
+        ERR_NO_ID_COLUMN: dict(failed=True, msg="No id column, you should disable 'return_id' parameter")
     }
 
     with closing(connect(build_connection_parameter(module.params), module)) as db_connection:
         # find out what needs to be done (independently of check-mode)
-        required_action = change_required(module.params['state'], db_connection.cursor(), table, identifiers, values)
+        required_action, row_id = change_required(module.params['state'], db_connection.cursor(), table, identifiers, values, module.params['return_id'])
 
         # if we're in check mode, there's no action required, or we already failed: directly set the exit_message
         if module.check_mode or required_action == NO_ACTION_REQUIRED or failed(required_action):
             exit_message = exit_messages[required_action]
+            exit_message.update(row_id=row_id)
         else:
             # otherwise, execute the required action to get the exit message
-            exit_message = execute_action(db_connection.cursor(), required_action, table, identifiers, values, defaults)
+            exit_message = execute_action(db_connection.cursor(), required_action, table, identifiers, values, defaults, row_id)
             db_connection.commit()
 
     if 'failed' in exit_message and exit_message.get('failed'):

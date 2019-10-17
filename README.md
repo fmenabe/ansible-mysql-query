@@ -46,6 +46,7 @@ Example playbook
         defaults:
           password: "secret"
           last_login: 1469264933
+        return_id: false
 ```
 
 Given a table `simple_table` with columns (*id*, *email*, *role*, *department*, *password*, *last_login*), this example would:
@@ -57,6 +58,7 @@ Thus:
 - *identifieres* are being used to check for existence and to find a row
 - *defaults* are being used as default values if the row is not present (i.e.: only used for insert)
 - *values* are the state of the row that ansible ensures
+- *return_id* (default: *false*) indicate whether to return the value of *id* column as *row_id* in result
 
 ### A complete example that ensures a record is not present in a given table.
 
